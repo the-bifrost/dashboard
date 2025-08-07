@@ -1,0 +1,6 @@
+{
+    "/sensores/esp8266-tempo/date": "Data",
+     "/sensores/esp8266-tempo/time": "Horario",
+      "/sensores/Umidade-MQTT/temperature": "Temperatura",
+       "/sensores/Umidade-MQTT/humidity": "Umidade"
+    }

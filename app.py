@@ -50,7 +50,6 @@ def on_message(client, userdata, msg):
         # Manter como string se não for numérico
         sensor_history[topic].append((time.time(), payload))
     
-    print(f"Mensagem recebida: {topic} -> {payload}")
     socketio.emit('mqtt_message', {
         'topic': topic,
         'payload': payload,

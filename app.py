@@ -5,9 +5,12 @@ from collections import defaultdict, deque
 import time
 import json
 import os
+import threading
+from queue import Queue
+import asyncio
 
 app = Flask(__name__)
-socketio = SocketIO(app)
+socketio = SocketIO(app, async_mode='threading', engineio_logger=False)
 
 # Configurações do MQTT
 MQTT_BROKER = "localhost"
@@ -17,6 +20,9 @@ MQTT_TOPICS = ["#"]
 # Armazenamento de histórico (tópico: deque de valores)
 HISTORY_LENGTH = 50
 sensor_history = defaultdict(lambda: deque(maxlen=HISTORY_LENGTH))
+
+# Buffer para mensagens MQTT
+message_queue = Queue(maxsize=1000)
 
 # Armazenamento de nomes personalizados
 CUSTOM_NAMES_FILE = 'custom_names.json'
@@ -39,27 +45,61 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(topic)
 
 def on_message(client, userdata, msg):
-    payload = msg.payload.decode()
-    topic = msg.topic
-    
     try:
-        # Tentar converter para float se possível
-        numeric_value = float(payload)
-        sensor_history[topic].append((time.time(), numeric_value))
-    except ValueError:
-        # Manter como string se não for numérico
-        sensor_history[topic].append((time.time(), payload))
-    
-    socketio.emit('mqtt_message', {
-        'topic': topic,
-        'payload': payload,
-        'history': list(sensor_history[topic])[-10:]  # Enviar último histórico
-    })
+        payload = msg.payload.decode()
+        topic = msg.topic
+        
+        # Adiciona mensagem à fila
+        message_queue.put((topic, payload, time.time()))
+        
+    except Exception as e:
+        print(f"Erro ao processar mensagem: {e}")
 
 client.on_connect = on_connect
 client.on_message = on_message
 client.connect(MQTT_BROKER, MQTT_PORT, 60)
 client.loop_start()
+
+# Thread para processar mensagens MQTT
+def process_messages():
+    last_broadcast = time.time()
+    batch = {}
+    
+    while True:
+        try:
+            # Processar todas as mensagens na fila
+            while not message_queue.empty():
+                topic, payload, timestamp = message_queue.get_nowait()
+                
+                try:
+                    # Tentar converter para float se possível
+                    numeric_value = float(payload)
+                    sensor_history[topic].append((timestamp, numeric_value))
+                except ValueError:
+                    # Manter como string se não for numérico
+                    sensor_history[topic].append((timestamp, payload))
+                
+                # Adicionar ao batch
+                if topic not in batch:
+                    batch[topic] = {
+                        'payload': payload,
+                        'timestamp': timestamp
+                    }
+            
+            # Enviar batch a cada 50ms
+            if batch and (time.time() - last_broadcast > 0.05):
+                socketio.emit('mqtt_batch', list(batch.items()))
+                batch = {}
+                last_broadcast = time.time()
+                
+            # Pausa para evitar consumo excessivo de CPU
+            time.sleep(0.01)
+            
+        except Exception as e:
+            print(f"Erro no processamento de mensagens: {e}")
+
+# Iniciar thread de processamento
+threading.Thread(target=process_messages, daemon=True).start()
 
 @app.route('/update_name', methods=['POST'])
 def update_name():
@@ -125,6 +165,9 @@ def index():
                 font-family: 'Poppins', sans-serif;
                 background-color: var(--dark);
                 color: #FFFFFF;
+                margin: 0;
+                padding: 0;
+                overflow-x: hidden;
             }
             .sensor-card {
                 background-color: var(--card);
@@ -147,12 +190,12 @@ def index():
                 position: relative;
             }
             .pulse {
-                animation: pulse 2s infinite;
+                animation: pulse 1s ease;
             }
             @keyframes pulse {
-                0% { box-shadow: 0 0 0 0 rgba(65, 189, 245, 0.4); }
-                70% { box-shadow: 0 0 0 10px rgba(65, 189, 245, 0); }
-                100% { box-shadow: 0 0 0 0 rgba(65, 189, 245, 0); }
+                0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(65, 189, 245, 0.4); }
+                50% { transform: scale(1.02); }
+                100% { transform: scale(1); box-shadow: 0 0 0 10px rgba(65, 189, 245, 0); }
             }
             .add-btn {
                 background: linear-gradient(135deg, var(--primary), var(--secondary));
@@ -167,6 +210,9 @@ def index():
                 color: var(--accent);
                 font-size: 0.7rem;
             }
+            .value-change {
+                transition: all 0.3s ease;
+            }
         </style>
     </head>
     <body class="min-h-screen">
@@ -178,9 +224,14 @@ def index():
                 </div>
                 <h1 class="text-2xl font-bold">Bifrost Dashboard</h1>
             </div>
-            <div class="flex items-center">
-                <div class="w-3 h-3 rounded-full bg-green-500 mr-2"></div>
-                <span class="text-green-500">Conectado</span>
+            <div class="flex items-center gap-4">
+                <div class="text-sm">
+                    <span id="messageRate">0</span> msg/s
+                </div>
+                <div class="flex items-center">
+                    <div class="w-3 h-3 rounded-full bg-green-500 mr-2"></div>
+                    <span class="text-green-500">Conectado</span>
+                </div>
             </div>
         </div>
         
@@ -235,10 +286,12 @@ def index():
         </div>
 
         <script>
-            const socket = io();
+            const socket = io({ transports: ['websocket'] });
             const sensorCards = {};
             const recentTopics = new Set();
             const customNames = {};
+            let messageCount = 0;
+            let lastMessageUpdate = Date.now();
             
             // Carregar nomes personalizados do localStorage
             function loadCustomNames() {
@@ -270,42 +323,103 @@ def index():
                 }
             }
             
-            // Processar mensagem MQTT
-            socket.on('mqtt_message', (data) => {
-                const { topic, payload, history } = data;
+            // Processar mensagens em batch
+            socket.on('mqtt_batch', (batch) => {
+                messageCount += batch.length;
                 
-                // Adicionar tópico aos recentes
-                if (!recentTopics.has(topic)) {
-                    recentTopics.add(topic);
-                    updateRecentTopics();
+                // Atualizar taxa de mensagens a cada segundo
+                const now = Date.now();
+                if (now - lastMessageUpdate > 1000) {
+                    document.getElementById('messageRate').textContent = messageCount;
+                    messageCount = 0;
+                    lastMessageUpdate = now;
                 }
                 
-                // Atualizar card existente
-                if (sensorCards[topic]) {
-                    const card = sensorCards[topic];
+                // Processar cada mensagem do batch
+                for (const [topic, data] of batch) {
+                    const { payload, timestamp } = data;
                     
-                    // Atualizar valor
-                    card.querySelector('.current-value').textContent = payload;
-                    
-                    // Adicionar ao histórico
-                    const timestamp = Date.now() / 1000;
-                    card.chartData.labels.push(new Date().toLocaleTimeString());
-                    card.chartData.datasets[0].data.push(payload);
-                    
-                    // Manter apenas os últimos pontos
-                    if (card.chartData.labels.length > 15) {
-                        card.chartData.labels.shift();
-                        card.chartData.datasets[0].data.shift();
+                    // Adicionar tópico aos recentes
+                    if (!recentTopics.has(topic)) {
+                        recentTopics.add(topic);
+                        updateRecentTopics();
                     }
                     
-                    // Atualizar gráfico
-                    card.chart.update();
-                    
-                    // Efeito de pulsação
-                    card.classList.add('pulse');
-                    setTimeout(() => card.classList.remove('pulse'), 1000);
+                    // Atualizar card existente
+                    if (sensorCards[topic]) {
+                        const card = sensorCards[topic];
+                        
+                        // Atualizar valor com animação
+                        const valueElement = card.querySelector('.current-value');
+                        const prevValue = parseFloat(valueElement.textContent) || 0;
+                        const newValue = parseFloat(payload) || payload;
+                        
+                        valueElement.textContent = payload;
+                        
+                        // Adicionar ao histórico do gráfico
+                        if (card.chart) {
+                            const chart = card.chart;
+                            const datasets = chart.data.datasets;
+                            
+                            if (datasets.length > 0) {
+                                const data = datasets[0].data;
+                                data.push(newValue);
+                                
+                                // Manter apenas os últimos pontos
+                                if (data.length > 15) {
+                                    data.shift();
+                                    chart.data.labels.shift();
+                                }
+                                
+                                // Atualizar gráfico na próxima animação
+                                pendingUpdates.add(() => {
+                                    chart.update('none');
+                                });
+                            }
+                        }
+                        
+                        // Atualizar tempo
+                        const timeElement = card.querySelector('.update-time');
+                        timeElement.textContent = 'agora';
+                        
+                        // Efeito visual
+                        if (typeof newValue === 'number') {
+                            const diff = newValue - prevValue;
+                            if (diff !== 0) {
+                                valueElement.classList.add('pulse');
+                                valueElement.classList.remove('text-success', 'text-danger');
+                                valueElement.classList.add(diff > 0 ? 'text-success' : 'text-danger');
+                                
+                                setTimeout(() => {
+                                    valueElement.classList.remove('pulse', 'text-success', 'text-danger');
+                                }, 1000);
+                            }
+                        }
+                    }
                 }
+                
+                // Agendar atualização de UI
+                scheduleUIUpdate();
             });
+            
+            // Agendador de atualizações de UI
+            let pendingUpdates = new Set();
+            let updateScheduled = false;
+            
+            function scheduleUIUpdate() {
+                if (!updateScheduled) {
+                    updateScheduled = true;
+                    requestAnimationFrame(processUIUpdates);
+                }
+            }
+            
+            function processUIUpdates() {
+                // Executar todas as atualizações pendentes
+                pendingUpdates.forEach(update => update());
+                pendingUpdates.clear();
+                
+                updateScheduled = false;
+            }
             
             // Atualizar lista de tópicos recentes
             function updateRecentTopics() {
@@ -344,16 +458,22 @@ def index():
                 return 'fa-wave-square';
             }
             
-            // Criar gráfico
+            // Criar gráfico otimizado
             function createChart(canvas, initialData = []) {
                 const ctx = canvas.getContext('2d');
+                
+                // Criar gradient para o gráfico
+                const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+                gradient.addColorStop(0, 'rgba(65, 189, 245, 0.4)');
+                gradient.addColorStop(1, 'rgba(65, 189, 245, 0.05)');
+                
                 const data = {
                     labels: Array(initialData.length).fill(''),
                     datasets: [{
                         label: 'Valor',
                         data: initialData,
                         borderColor: '#41BDF5',
-                        backgroundColor: 'rgba(65, 189, 245, 0.1)',
+                        backgroundColor: gradient,
                         borderWidth: 2,
                         pointRadius: 0,
                         tension: 0.4,
@@ -372,15 +492,26 @@ def index():
                             tooltip: { enabled: false }
                         },
                         scales: {
-                            x: { display: false },
+                            x: { 
+                                display: false,
+                                grid: { display: false }
+                            },
                             y: { 
                                 display: false,
-                                suggestedMin: Math.min(...initialData) - 2,
-                                suggestedMax: Math.max(...initialData) + 2
+                                grid: { display: false },
+                                suggestedMin: Math.min(...initialData) - 1,
+                                suggestedMax: Math.max(...initialData) + 1
                             }
                         },
-                        interaction: { mode: 'nearest', intersect: false },
-                        animation: { duration: 0 }
+                        interaction: { mode: null },
+                        animation: {
+                            duration: 0,
+                            easing: 'linear'
+                        },
+                        elements: {
+                            point: { radius: 0 }
+                        },
+                        hover: { mode: null }
                     }
                 });
             }
@@ -457,7 +588,7 @@ def index():
                     
                     <div class="px-5 py-3 bg-light flex justify-between items-center">
                         <div class="text-sm text-gray-400">
-                            <i class="fas fa-clock mr-1"></i> Atualizado: <span class="update-time">agora</span>
+                            <i class="fas fa-clock mr-1"></i> Atualizado: <span class="update-time">--:--:--</span>
                         </div>
                         <div class="flex items-center">
                             <span class="w-2 h-2 rounded-full bg-green-500 mr-2"></span>
@@ -469,13 +600,12 @@ def index():
                 document.getElementById('sensorCards').appendChild(card);
                 sensorCards[topic] = card;
                 
-                // Inicializar gráfico
+                // Inicializar gráfico com os últimos 15 pontos
                 const canvas = card.querySelector(`#chart-${cardId}`);
-                card.chart = createChart(canvas, initialData);
-                card.chartData = {
-                    labels: Array(initialData.length).fill(''),
-                    datasets: [{ data: initialData }]
-                };
+                if (canvas) {
+                    const lastValues = initialData.slice(-15);
+                    card.chart = createChart(canvas, lastValues);
+                }
                 
                 // Limpar inputs
                 topicInput.value = '';
@@ -535,4 +665,4 @@ def handle_connect():
     print("Cliente WebSocket conectado")
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
